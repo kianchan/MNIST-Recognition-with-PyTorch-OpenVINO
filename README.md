@@ -16,7 +16,7 @@ Evaluation outputs:
 - Test time
 - Confusion matrix (results/confusion_matrix.png)
 - Sample predictions (results/sample_predictions.png)
-- Compatible with Windows and Linux.
+
 
 Requirements   
 1. Python dependencies   
