@@ -245,7 +245,10 @@ def convert_to_openvino(model, input_shape, precision, output_dir="openvino_mode
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Move model to CPU for conversion
     model.eval()
+    model.to("cpu")
+
     dummy_input = torch.randn(input_shape)
 
     ov_model = ov.convert_model(model, example_input=dummy_input)
