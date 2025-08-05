@@ -116,17 +116,22 @@ def train_model(model, train_loader, test_loader, device, epochs=1, intel_device
     print("[INFO] Starting training...")
     start_time = time.time()
 
-    model.to(device)
-    criterion = nn.CrossEntropyLoss()
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-    scaler = None
     if intel_device:
-        print("[INFO] Intel GPU detected: GradScaler disabled for IPEX.")
-    elif device.type == 'cuda' and use_amp:
-        scaler = torch.amp.GradScaler('cuda')
+        import intel_extension_for_pytorch as ipex
+        dtype = torch.bfloat16 if use_amp else None
+        model, optimizer = ipex.optimize(
+            model,
+            optimizer=optimizer,
+            dtype=dtype,
+            inplace=True,
+            fuse_update_step=True  # Use Optimizer Fusion
+            # https://intel.github.io/intel-extension-for-pytorch/xpu/latest/tutorials/technical_details/optimizer_fusion_gpu.html
+        )
 
-    # Loss history
     training_losses = []
     validation_losses = []
 
@@ -134,39 +139,42 @@ def train_model(model, train_loader, test_loader, device, epochs=1, intel_device
         model.train()
         total_loss = 0
         pbar = tqdm(train_loader, desc=f"[TRAIN] Epoch [{epoch+1}/{epochs}]", unit="batch")
+
         for images, labels in pbar:
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
 
-            if scaler:
-                with torch.amp.autocast('cuda'):
+            if intel_device and use_amp:
+                with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
                     outputs = model(images)
                     loss = criterion(outputs, labels)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
 
+            loss.backward()
+            optimizer.step()
             total_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
 
         avg_train_loss = total_loss / len(train_loader)
         training_losses.append(avg_train_loss)
 
-        # ======================
-        # Validation loss
-        # ======================
+        # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for images, labels in test_loader:
                 images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+
+                if intel_device and use_amp:
+                    with torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                        outputs = model(images)
+                        loss = criterion(outputs, labels)
+                else:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(test_loader)
@@ -177,9 +185,7 @@ def train_model(model, train_loader, test_loader, device, epochs=1, intel_device
     total_time = time.time() - start_time
     print(f"[INFO] Total training time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
 
-    # ======================
-    # Plot and save the loss graph
-    # ======================
+    # Plot
     results_dir = Path("results")
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -195,9 +201,9 @@ def train_model(model, train_loader, test_loader, device, epochs=1, intel_device
     graph_path = results_dir / "loss_curve.png"
     plt.savefig(graph_path)
     print(f"[INFO] Saved loss graph to {graph_path}")
-    # plt.show()  # Disabled to avoid OpenMP runtime conflict
 
     return model
+
 
 
 # ===========================
@@ -220,48 +226,55 @@ def evaluate_model(model, test_loader, device):
         print(f"[RESULT] Test Accuracy: {acc * 100:.2f}%")
 
     except RuntimeError as e:
-        if "UR" in str(e):
-            print(f"[WARN] UR error detected during evaluation on device: {device}")
-            print("[INFO] Switching evaluation to CPU...")
+        if "UR" in str(e) or "unregistered" in str(e).lower():
+            print(f"[WARN] UR error during evaluation on {device}, switching to CPU fallback...")
             model.to("cpu")
+            model.eval()
             correct = 0
             with torch.no_grad():
                 for images, labels in test_loader:
                     outputs = model(images.to("cpu"))
                     pred = outputs.argmax(dim=1)
                     correct += (pred == labels).sum().item()
-
             acc = correct / len(test_loader.dataset)
             print(f"[RESULT] Test Accuracy (CPU fallback): {acc * 100:.2f}%")
         else:
             raise e
 
 
+
 # ===========================
 # Direct PyTorch → OpenVINO Conversion
 # ===========================
 def convert_to_openvino(model, input_shape, precision, output_dir="openvino_model"):
-    print("[INFO] Starting direct PyTorch → OpenVINO conversion...")
+    print("[INFO] Starting PyTorch → OpenVINO conversion...")
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Move model to CPU for conversion
     model.eval()
-    model.to("cpu")
+
+    current_device = next(model.parameters()).device
+    if current_device.type != "cpu":
+        print(f"[INFO] Moving model from {current_device} to CPU for conversion...")
+        model = model.to("cpu")
 
     dummy_input = torch.randn(input_shape)
+
+    import openvino as ov
+    from openvino import serialize
 
     ov_model = ov.convert_model(model, example_input=dummy_input)
 
     precision_map = {"INT8": "int8", "BF16": "bf16", "FP16": "fp16", "FP32": "fp32"}
-    p = precision_map[precision.upper()]
+    p = precision_map.get(precision.upper(), "fp16")
 
     core = ov.Core()
-    core.compile_model(ov_model, "CPU", config={"INFERENCE_PRECISION_HINT": p})
+    compiled_model = core.compile_model(ov_model, "CPU", config={"INFERENCE_PRECISION_HINT": p})
 
-    serialize(ov_model, str(output_path / f"model_{p}.xml"))
-    print(f"[SUCCESS] Converted model saved at {output_path}/model_{p}.xml")
-
+    model_path = output_path / f"model_{p}.xml"
+    serialize(ov_model, str(model_path))
+    print(f"[SUCCESS] Converted model saved at: {model_path}")
 
 # ===========================
 # Unzip MNIST Data if Needed
